@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MTG Card Scanner</title>
+<style>
+  body{font-family:sans-serif;max-width:700px;margin:20px auto;padding:0 12px;}
+  h2{margin-bottom:4px;}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0;}
+  button{padding:8px 12px;font-size:14px;cursor:pointer;}
+  #stage{position:relative;width:100%;max-width:400px;background:#eee;border:1px solid #ccc;}
+  video, #captured{width:100%;display:block;}
+  #cropWrap{position:absolute;inset:0;display:none;}
+  #cropFrame{
+    position:absolute;border:2px solid red;box-shadow:0 0 0 2000px rgba(0,0,0,0.4);
+    cursor:move;touch-action:none;
+  }
+  .corner{position:absolute;width:16px;height:16px;background:red;}
+  .corner.tl{top:-8px;left:-8px;cursor:nwse-resize;}
+  .corner.tr{top:-8px;right:-8px;cursor:nesw-resize;}
+  .corner.bl{bottom:-8px;left:-8px;cursor:nesw-resize;}
+  .corner.br{bottom:-8px;right:-8px;cursor:nwse-resize;}
+  input[type=text]{width:100%;padding:8px;font-size:14px;box-sizing:border-box;}
+  #suggestions{border:1px solid #ccc;max-height:160px;overflow-y:auto;}
+  #suggestions div{padding:6px 8px;cursor:pointer;}
+  #suggestions div:hover{background:#eee;}
+  #result{margin-top:12px;display:flex;gap:12px;}
+  #result img{width:120px;}
+  #status{font-size:13px;color:#555;min-height:16px;}
+  #binder{margin-top:16px;}
+  .binder-item{display:inline-block;width:90px;text-align:center;margin:4px;vertical-align:top;font-size:12px;}
+  .binder-item img{width:100%;}
+  fieldset{margin-top:16px;}
+</style>
+</head>
+<body>
+
+<h2>MTG Card Scanner</h2>
+<p>Camera/crop for framing the card, Scryfall autocomplete + exact/fuzzy name lookup for identification, native <code>TextDetector</code> (if supported) for an optional auto-filled guess.</p>
+
+<fieldset>
+<legend>1. Capture</legend>
+<div id="stage">
+  <div id="placeholder" style="padding:40px;text-align:center;color:#888;">Camera off</div>
+  <video id="video" autoplay playsinline muted style="display:none;"></video>
+  <img id="captured" style="display:none;" />
+  <div id="cropWrap">
+    <div id="cropFrame">
+      <div class="corner tl"></div>
+      <div class="corner tr"></div>
+      <div class="corner bl"></div>
+      <div class="corner br"></div>
+    </div>
+  </div>
+</div>
+<div class="row">
+  <button id="btnStartCam">Start camera</button>
+  <button id="btnCapture" disabled>Capture</button>
+  <button id="btnUpload">Upload photo</button>
+  <input type="file" id="fileInput" accept="image/*" capture="environment" style="display:none;" />
+  <button id="btnRetake" style="display:none;">Retake</button>
+</div>
+<div class="row">
+  <button id="btnReadTitle" disabled>Read title (auto-fill guess)</button>
+</div>
+<div id="detectorNote" style="font-size:12px;color:#777;"></div>
+</fieldset>
+
+<fieldset>
+<legend>2. Identify (via Scryfall)</legend>
+<input type="text" id="searchInput" placeholder="Card name..." autocomplete="off" />
+<div id="suggestions"></div>
+<div id="status"></div>
+<div id="result"></div>
+</fieldset>
+
+<fieldset id="binder">
+<legend>Binder</legend>
+<div id="binderList"><i>Nothing added yet.</i></div>
+<div class="row">
+  <button id="btnExport">Export .txt</button>
+  <button id="btnClear">Clear</button>
+</div>
+</fieldset>
+
+<canvas id="workCanvas" style="display:none;"></canvas>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const stage = $('stage'), placeholder = $('placeholder');
+  const video = $('video'), captured = $('captured');
+  const cropWrap = $('cropWrap'), cropFrame = $('cropFrame');
+  const btnStartCam = $('btnStartCam'), btnCapture = $('btnCapture');
+  const btnUpload = $('btnUpload'), fileInput = $('fileInput'), btnRetake = $('btnRetake');
+  const btnReadTitle = $('btnReadTitle'), detectorNote = $('detectorNote');
+  const searchInput = $('searchInput'), suggestions = $('suggestions');
+  const statusEl = $('status'), resultEl = $('result');
+  const binderList = $('binderList');
+  const btnExport = $('btnExport'), btnClear = $('btnClear');
+  const workCanvas = $('workCanvas');
+
+  let stream = null;
+  let sourceCanvas = null;
+  let binder = [];
+  let currentCard = null;
+
+  // ---------- Text detector availability ----------
+  const hasTextDetector = 'TextDetector' in window;
+  detectorNote.textContent = hasTextDetector
+    ? 'Native text scan available — will pre-fill a guess to confirm.'
+    : 'No native text scanner in this browser — type the name manually, autocomplete below will help.';
+
+  // ---------- Camera ----------
+  btnStartCam.addEventListener('click', async () => {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } }, audio: false
+      });
+      video.srcObject = stream;
+      video.style.display = 'block';
+      placeholder.style.display = 'none';
+      captured.style.display = 'none';
+      cropWrap.style.display = 'none';
+      btnCapture.disabled = false;
+    } catch (e) {
+      statusEl.textContent = 'Camera error: ' + e.message;
+    }
+  });
+
+  btnCapture.addEventListener('click', () => {
+    const w = video.videoWidth, h = video.videoHeight;
+    if (!w) return;
+    workCanvas.width = w; workCanvas.height = h;
+    workCanvas.getContext('2d').drawImage(video, 0, 0, w, h);
+    finishCapture(workCanvas.toDataURL('image/jpeg', 0.92));
+    stopCamera();
+  });
+
+  btnUpload.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const img = new Image();
+      img.onload = () => {
+        workCanvas.width = img.naturalWidth;
+        workCanvas.height = img.naturalHeight;
+        workCanvas.getContext('2d').drawImage(img, 0, 0);
+        finishCapture(workCanvas.toDataURL('image/jpeg', 0.92));
+        stopCamera();
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(f);
+  });
+
+  function stopCamera(){
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    video.style.display = 'none';
+    btnCapture.disabled = true;
+  }
+
+  function finishCapture(dataUrl){
+    captured.src = dataUrl;
+    captured.style.display = 'block';
+    placeholder.style.display = 'none';
+    btnRetake.style.display = 'inline-block';
+    btnReadTitle.disabled = !hasTextDetector;
+
+    captured.onload = () => {
+      sourceCanvas = document.createElement('canvas');
+      sourceCanvas.width = captured.naturalWidth;
+      sourceCanvas.height = captured.naturalHeight;
+      sourceCanvas.getContext('2d').drawImage(captured, 0, 0);
+      setupCropFrame();
+    };
+  }
+
+  btnRetake.addEventListener('click', () => {
+    captured.style.display = 'none';
+    cropWrap.style.display = 'none';
+    placeholder.style.display = 'block';
+    btnRetake.style.display = 'none';
+    btnReadTitle.disabled = true;
+    sourceCanvas = null;
+  });
+
+  // ---------- Crop frame (drag + resize) ----------
+  function setupCropFrame(){
+    cropWrap.style.display = 'block';
+    const stageRect = stage.getBoundingClientRect();
+    const h = stageRect.height * 0.78;
+    const w = h * (2.5/3.5);
+    const left = (stageRect.width - w)/2;
+    const top = (stageRect.height - h)/2;
+    Object.assign(cropFrame.style, { left:left+'px', top:top+'px', width:w+'px', height:h+'px' });
+  }
+
+  let dragMode = null, dragStart = null, frameStart = null;
+
+  cropFrame.addEventListener('pointerdown', e => {
+    const target = e.target.closest('.corner');
+    dragMode = target ? target.className.replace('corner ', '') : 'move';
+    dragStart = { x: e.clientX, y: e.clientY };
+    const f = cropFrame.getBoundingClientRect(), s = cropWrap.getBoundingClientRect();
+    frameStart = { left: f.left - s.left, top: f.top - s.top, width: f.width, height: f.height };
+    cropFrame.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+
+  cropFrame.addEventListener('pointermove', e => {
+    if (!dragMode) return;
+    const dx = e.clientX - dragStart.x, dy = e.clientY - dragStart.y;
+    const s = cropWrap.getBoundingClientRect();
+    let { left, top, width, height } = frameStart;
+
+    if (dragMode === 'move') {
+      left = Math.min(Math.max(0, left+dx), s.width - width);
+      top = Math.min(Math.max(0, top+dy), s.height - height);
+    } else {
+      if (dragMode.includes('r')) width = Math.min(Math.max(40, width+dx), s.width-left);
+      if (dragMode.includes('l')) { const nw = Math.min(Math.max(40, width-dx), left+width); left = left+width-nw; width = nw; }
+      if (dragMode.includes('b')) height = Math.min(Math.max(40, height+dy), s.height-top);
+      if (dragMode.includes('t')) { const nh = Math.min(Math.max(40, height-dy), top+height); top = top+height-nh; height = nh; }
+    }
+    Object.assign(cropFrame.style, { left:left+'px', top:top+'px', width:width+'px', height:height+'px' });
+  });
+
+  cropFrame.addEventListener('pointerup', () => dragMode = null);
+  cropFrame.addEventListener('pointercancel', () => dragMode = null);
+
+  function getCropRectOnSource(){
+    const s = cropWrap.getBoundingClientRect();
+    const f = cropFrame.getBoundingClientRect();
+    const scaleX = sourceCanvas.width / s.width;
+    const scaleY = sourceCanvas.height / s.height;
+    return {
+      x: (f.left - s.left) * scaleX,
+      y: (f.top - s.top) * scaleY,
+      w: f.width * scaleX,
+      h: f.height * scaleY
+    };
+  }
+
+  // ---------- Native text read (title band only) ----------
+  btnReadTitle.addEventListener('click', async () => {
+    if (!hasTextDetector || !sourceCanvas) return;
+    statusEl.textContent = 'Reading title band...';
+    try {
+      const rect = getCropRectOnSource();
+      const bandH = rect.h * 0.16;
+      const band = document.createElement('canvas');
+      band.width = rect.w; band.height = bandH;
+      band.getContext('2d').drawImage(sourceCanvas, rect.x, rect.y, rect.w, bandH, 0, 0, rect.w, bandH);
+
+      const detector = new TextDetector();
+      const blocks = await detector.detect(band);
+      if (!blocks.length) {
+        statusEl.textContent = 'No text found — adjust crop or type manually.';
+        return;
+      }
+      blocks.sort((a,b) => b.boundingBox.width - a.boundingBox.width);
+      let guess = blocks[0].rawValue.replace(/[^\w\s',.\-]/g, '').trim();
+      searchInput.value = guess;
+      statusEl.textContent = 'Guessed "' + guess + '" — confirm below.';
+      runAutocomplete(guess);
+    } catch (e) {
+      statusEl.textContent = 'Text scan failed: ' + e.message;
+    }
+  });
+
+  // ---------- Scryfall throttled fetch ----------
+  let lastCall = 0;
+  async function scryfallFetch(url){
+    const now = Date.now();
+    const wait = Math.max(0, 120 - (now - lastCall));
+    if (wait) await new Promise(r => setTimeout(r, wait));
+    lastCall = Date.now();
+    return fetch(url);
+  }
+
+  // ---------- Autocomplete ----------
+  let debounceTimer = null;
+  searchInput.addEventListener('input', () => {
+    clearTimeout(debounceTimer);
+    const q = searchInput.value.trim();
+    if (q.length < 2) { suggestions.innerHTML = ''; return; }
+    debounceTimer = setTimeout(() => runAutocomplete(q), 250);
+  });
+
+  async function runAutocomplete(q){
+    if (!q || q.length < 2) { suggestions.innerHTML = ''; return; }
+    try {
+      const res = await scryfallFetch(`https://api.scryfall.com/cards/autocomplete?q=${encodeURIComponent(q)}`);
+      const data = await res.json();
+      const names = data.data || [];
+      suggestions.innerHTML = '';
+      names.slice(0, 10).forEach(name => {
+        const div = document.createElement('div');
+        div.textContent = name;
+        div.addEventListener('click', () => {
+          searchInput.value = name;
+          suggestions.innerHTML = '';
+          fetchExact(name);
+        });
+        suggestions.appendChild(div);
+      });
+    } catch (e) { /* best-effort */ }
+  }
+
+  searchInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      suggestions.innerHTML = '';
+      fetchExact(searchInput.value.trim(), true);
+    }
+  });
+
+  async function fetchExact(name, allowFuzzy){
+    if (!name) return;
+    statusEl.textContent = 'Looking up "' + name + '"...';
+    try {
+      let res = await scryfallFetch(`https://api.scryfall.com/cards/named?exact=${encodeURIComponent(name)}`);
+      if (res.status === 404 && allowFuzzy) {
+        res = await scryfallFetch(`https://api.scryfall.com/cards/named?fuzzy=${encodeURIComponent(name)}`);
+      }
+      if (!res.ok) {
+        statusEl.textContent = 'No match found.';
+        return;
+      }
+      const card = await res.json();
+      renderCard(card);
+      statusEl.textContent = 'Matched via Scryfall.';
+    } catch (e) {
+      statusEl.textContent = 'Lookup failed: ' + e.message;
+    }
+  }
+
+  // ---------- Render card result ----------
+  function getImage(card){
+    if (card.image_uris) return card.image_uris.normal;
+    if (card.card_faces && card.card_faces[0].image_uris) return card.card_faces[0].image_uris.normal;
+    return '';
+  }
+  function getManaCost(card){
+    if (card.mana_cost) return card.mana_cost;
+    if (card.card_faces) return card.card_faces.map(f => f.mana_cost).filter(Boolean).join(' // ');
+    return '';
+  }
+  function getOracle(card){
+    if (card.oracle_text) return card.oracle_text;
+    if (card.card_faces) return card.card_faces.map(f => f.name + ' - ' + (f.oracle_text||'')).join('\n\n');
+    return '';
+  }
+
+  function renderCard(card){
+    currentCard = card;
+    const img = getImage(card);
+    const price = card.prices && card.prices.usd ? '$' + card.prices.usd : '-';
+    resultEl.innerHTML = `
+      ${img ? `<img src="${img}" alt="${card.name}">` : ''}
+      <div>
+        <b>${card.name}</b><br>
+        <small>${getManaCost(card)}</small><br>
+        <small>${card.type_line || ''}</small>
+        <p style="font-size:12px;max-height:100px;overflow-y:auto;">${(getOracle(card)||'').replace(/\n/g,'<br>')}</p>
+        <small>${(card.set||'').toUpperCase()} #${card.collector_number||'?'} · ${price}</small><br>
+        <a href="${card.scryfall_uri}" target="_blank" rel="noopener">Scryfall page</a><br>
+        <button id="btnAdd">Add to binder</button>
+      </div>
+    `;
+    $('btnAdd').addEventListener('click', addToBinder);
+  }
+
+  // ---------- Binder ----------
+  function addToBinder(){
+    if (!currentCard) return;
+    const key = currentCard.name + '|' + currentCard.set + '|' + currentCard.collector_number;
+    const existing = binder.find(b => b.key === key);
+    if (existing) existing.count++;
+    else binder.push({
+      key, name: currentCard.name, set: currentCard.set, collector_number: currentCard.collector_number,
+      image: getImage(currentCard), uri: currentCard.scryfall_uri, count: 1
+    });
+    renderBinder();
+  }
+
+  function renderBinder(){
+    if (!binder.length) { binderList.innerHTML = '<i>Nothing added yet.</i>'; return; }
+    binderList.innerHTML = '';
+    binder.forEach((b, i) => {
+      const div = document.createElement('div');
+      div.className = 'binder-item';
+      div.innerHTML = `
+        ${b.image ? `<img src="${b.image}">` : ''}
+        ${b.name} x${b.count}<br>
+        <button data-i="${i}" class="rm">remove</button>
+      `;
+      div.querySelector('.rm').addEventListener('click', () => {
+        binder.splice(i,1);
+        renderBinder();
+      });
+      binderList.appendChild(div);
+    });
+  }
+
+  btnClear.addEventListener('click', () => { binder = []; renderBinder(); });
+
+  btnExport.addEventListener('click', () => {
+    if (!binder.length) return;
+    const lines = binder.map(b => `${b.count} ${b.name} (${(b.set||'').toUpperCase()}) ${b.collector_number}`);
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'decklist.txt';
+    a.click();
+  });
+})();
+</script>
+</body>
+</html>
