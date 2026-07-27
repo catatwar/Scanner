@@ -51,7 +51,6 @@
 <div id="result"></div>
 </fieldset>
 
-<canvas id="workCanvas" style="display:none;"></canvas>
 
 <script>
 (() => {
@@ -65,10 +64,10 @@
   const btnUpload = $('btnUpload'), fileInput = $('fileInput'), btnRetake = $('btnRetake');
   const searchInput = $('searchInput'), suggestions = $('suggestions');
   const statusEl = $('status'), resultEl = $('result');
-  const workCanvas = $('workCanvas');
 
   let stream = null;
   let currentCard = null;
+  let lastCollectorGuess = null;
 
   function setStatus(msg, isErr){
     statusEl.textContent = msg;
@@ -94,12 +93,12 @@
   btnCapture.addEventListener('click', () => {
     const w = video.videoWidth, h = video.videoHeight;
     if (!w) return;
-    workCanvas.width = w; workCanvas.height = h;
-    workCanvas.getContext('2d').drawImage(video, 0, 0, w, h);
-    const dataUrl = workCanvas.toDataURL('image/jpeg', 0.92);
+    const full = document.createElement('canvas');
+    full.width = w; full.height = h;
+    full.getContext('2d').drawImage(video, 0, 0, w, h);
     stopCamera();
-    showCaptured(dataUrl);
-    processImage(dataUrl);
+    showCaptured(full.toDataURL('image/jpeg', 0.92));
+    processImage(full);
   });
 
   btnUpload.addEventListener('click', () => fileInput.click());
@@ -110,13 +109,13 @@
     reader.onload = ev => {
       const img = new Image();
       img.onload = () => {
-        workCanvas.width = img.naturalWidth;
-        workCanvas.height = img.naturalHeight;
-        workCanvas.getContext('2d').drawImage(img, 0, 0);
-        const dataUrl = workCanvas.toDataURL('image/jpeg', 0.92);
+        const full = document.createElement('canvas');
+        full.width = img.naturalWidth;
+        full.height = img.naturalHeight;
+        full.getContext('2d').drawImage(img, 0, 0);
         stopCamera();
-        showCaptured(dataUrl);
-        processImage(dataUrl);
+        showCaptured(full.toDataURL('image/jpeg', 0.92));
+        processImage(full);
       };
       img.src = ev.target.result;
     };
@@ -141,6 +140,40 @@
     placeholder.style.display = 'block';
     btnRetake.style.display = 'none';
   });
+
+  // Crop a region from a canvas, given ratios of its width/height (0-1).
+  function cropRegion(canvas, xRatio, yRatio, wRatio, hRatio){
+    const sx = canvas.width * xRatio, sy = canvas.height * yRatio;
+    const sw = canvas.width * wRatio, sh = canvas.height * hRatio;
+    const out = document.createElement('canvas');
+    out.width = Math.max(1, Math.round(sw));
+    out.height = Math.max(1, Math.round(sh));
+    out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, out.width, out.height);
+    return out;
+  }
+
+  // Stack just the title strip and the bottom-left corner (where the collector
+  // number lives) into one small image, with a clear gap between them. This
+  // assumes the card roughly fills the captured frame. Sending only these two
+  // regions — rather than the whole card — keeps rules text, flavor text, artist
+  // credit, and copyright lines out of the OCR pass entirely, so there's nothing
+  // left for a stray digit to be confused with.
+  function buildScanComposite(sourceCanvas){
+    const titleCrop = cropRegion(sourceCanvas, 0, 0, 1, 0.14);
+    const collectorCrop = cropRegion(sourceCanvas, 0, 0.90, 0.4, 0.10);
+    const gap = 24;
+    const width = Math.max(titleCrop.width, collectorCrop.width);
+    const height = titleCrop.height + gap + collectorCrop.height;
+    const composite = document.createElement('canvas');
+    composite.width = width;
+    composite.height = height;
+    const ctx = composite.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(titleCrop, 0, 0);
+    ctx.drawImage(collectorCrop, 0, titleCrop.height + gap);
+    return composite;
+  }
 
   // ---------- OCR.space ----------
   async function runOCR(dataUrl){
@@ -181,50 +214,40 @@
     return plain[0] || '';
   }
 
-  // Collector number is printed small, bottom-left of the card — usually just "070",
-  // occasionally "070/264". Bare digits are ambiguous anywhere else on the card
-  // (mana cost, power/toughness, loyalty), so position is what disambiguates it,
-  // not the digit shape.
+  // The composite image guarantees the collector-number crop sits well below the
+  // title crop, with a blank gap between them — so "which cluster is a line in"
+  // is unambiguous, unlike guessing position from a full, cluttered card photo.
   function extractCollectorNumber(parsedResult){
     if (!parsedResult) return null;
     const lines = (parsedResult.TextOverlay && parsedResult.TextOverlay.Lines) || [];
     const numberLike = /^0*(\d{1,4})(\s*\/\s*\d{1,4})?[a-z]?$/i;
 
     if (lines.length) {
-      const tops = lines.map(l => l.MinTop);
-      const bottoms = lines.map(l => l.MinTop + (l.MaxHeight || 0));
-      const lefts = lines.map(l => Math.min(...(l.Words || []).map(w => w.Left)) || 0);
-      const minTop = Math.min(...tops), maxBottom = Math.max(...bottoms);
-      const minLeft = Math.min(...lefts), maxLeft = Math.max(...lefts);
-      const bottomThreshold = minTop + 0.75 * (maxBottom - minTop);
-      const leftThreshold = minLeft + 0.5 * (maxLeft - minLeft || 1);
-
-      const candidates = lines
-        .map((l, i) => ({ line: l, top: tops[i], left: lefts[i] }))
-        .filter(c => c.top >= bottomThreshold && c.left <= leftThreshold)
-        .map(c => ({ ...c, cleaned: c.line.LineText.trim() }))
-        .filter(c => numberLike.test(c.cleaned));
-
+      const maxBottom = Math.max(...lines.map(l => l.MinTop + (l.MaxHeight || 0)));
+      const splitY = maxBottom / 2; // the gap sits roughly in the middle of the composite
+      const candidates = lines.filter(l => {
+        const midY = l.MinTop + (l.MaxHeight || 0) / 2;
+        return midY > splitY && numberLike.test(l.LineText.trim());
+      });
       if (candidates.length) {
-        // prefer the bottom-most, left-most match
-        candidates.sort((a, b) => (b.top - a.top) || (a.left - b.left));
-        return candidates[0].cleaned.match(numberLike)[1];
+        candidates.sort((a, b) => b.MinTop - a.MinTop); // closest to the true bottom
+        return candidates[0].LineText.trim().match(numberLike)[1];
       }
     }
 
-    // Fallback with no position data: look for a NNN/NNN pair anywhere in the text.
+    // No position data at all — last resort, only trust an explicit NNN/NNN shape.
     const text = parsedResult.ParsedText || '';
     const slashMatch = text.match(/0*(\d{1,4})\s*\/\s*\d{1,4}/);
     return slashMatch ? slashMatch[1] : null;
   }
 
-  let lastCollectorGuess = null;
-
-  // ---------- Full pipeline: OCR -> guess -> Scryfall ----------
-  async function processImage(dataUrl){
+  // ---------- Full pipeline: crop -> OCR -> guess -> Scryfall ----------
+  async function processImage(sourceCanvas){
     resultEl.innerHTML = '';
     setStatus('Reading card text…');
     try {
+      const composite = buildScanComposite(sourceCanvas);
+      const dataUrl = composite.toDataURL('image/jpeg', 0.95);
       const parsed = await runOCR(dataUrl);
       const guess = extractNameGuess(parsed);
       lastCollectorGuess = extractCollectorNumber(parsed);
