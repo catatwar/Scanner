@@ -20,6 +20,26 @@
   #status{font-size:13px;color:#555;min-height:34px;white-space:pre-line;}
   fieldset{margin-top:16px;}
   label{font-size:13px;display:block;margin-bottom:4px;}
+
+  #printsBackdrop{
+    display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);
+    align-items:center;justify-content:center;z-index:1000;padding:16px;
+  }
+  #printsModal{
+    background:#fff;max-width:480px;width:100%;max-height:80vh;overflow-y:auto;
+    border-radius:8px;padding:16px;position:relative;
+  }
+  #printsClose{position:absolute;top:10px;right:10px;padding:4px 9px;}
+  #printsModal h3{margin:0 24px 10px 0;font-size:16px;}
+  .print-row{
+    display:flex;gap:10px;padding:8px 4px;border-bottom:1px solid #ddd;
+    cursor:pointer;align-items:center;
+  }
+  .print-row:hover{background:#f2f2f2;}
+  .print-row img{width:54px;border-radius:4px;flex-shrink:0;}
+  .print-row .info{flex:1;font-size:12.5px;line-height:1.4;}
+  .print-row .prices{font-size:12px;text-align:right;line-height:1.5;white-space:nowrap;}
+  #printsNote{font-size:11.5px;color:#888;margin-top:8px;}
 </style>
 </head>
 <body>
@@ -52,6 +72,15 @@
 </fieldset>
 
 
+<div id="printsBackdrop">
+  <div id="printsModal">
+    <button id="printsClose">✕</button>
+    <h3 id="printsTitle">Choose printing</h3>
+    <div id="printsList"></div>
+    <div id="printsNote"></div>
+  </div>
+</div>
+
 <script>
 (() => {
   // Paste your free OCR.space API key here (get one at https://ocr.space/ocrapi):
@@ -64,10 +93,11 @@
   const btnUpload = $('btnUpload'), fileInput = $('fileInput'), btnRetake = $('btnRetake');
   const searchInput = $('searchInput'), suggestions = $('suggestions');
   const statusEl = $('status'), resultEl = $('result');
+  const printsBackdrop = $('printsBackdrop'), printsList = $('printsList');
+  const printsTitle = $('printsTitle'), printsClose = $('printsClose'), printsNote = $('printsNote');
 
   let stream = null;
   let currentCard = null;
-  let lastCollectorGuess = null;
 
   function setStatus(msg, isErr){
     statusEl.textContent = msg;
@@ -152,29 +182,6 @@
     return out;
   }
 
-  // Stack just the title strip and the bottom-left corner (where the collector
-  // number lives) into one small image, with a clear gap between them. This
-  // assumes the card roughly fills the captured frame. Sending only these two
-  // regions — rather than the whole card — keeps rules text, flavor text, artist
-  // credit, and copyright lines out of the OCR pass entirely, so there's nothing
-  // left for a stray digit to be confused with.
-  function buildScanComposite(sourceCanvas){
-    const titleCrop = cropRegion(sourceCanvas, 0, 0, 1, 0.14);
-    const collectorCrop = cropRegion(sourceCanvas, 0, 0.90, 0.4, 0.10);
-    const gap = 24;
-    const width = Math.max(titleCrop.width, collectorCrop.width);
-    const height = titleCrop.height + gap + collectorCrop.height;
-    const composite = document.createElement('canvas');
-    composite.width = width;
-    composite.height = height;
-    const ctx = composite.getContext('2d');
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, width, height);
-    ctx.drawImage(titleCrop, 0, 0);
-    ctx.drawImage(collectorCrop, 0, titleCrop.height + gap);
-    return composite;
-  }
-
   // ---------- OCR.space ----------
   async function runOCR(dataUrl){
     if (!OCR_SPACE_API_KEY || OCR_SPACE_API_KEY === 'PASTE_YOUR_OCR_SPACE_API_KEY_HERE') {
@@ -214,52 +221,22 @@
     return plain[0] || '';
   }
 
-  // The composite image guarantees the collector-number crop sits well below the
-  // title crop, with a blank gap between them — so "which cluster is a line in"
-  // is unambiguous, unlike guessing position from a full, cluttered card photo.
-  function extractCollectorNumber(parsedResult){
-    if (!parsedResult) return null;
-    const lines = (parsedResult.TextOverlay && parsedResult.TextOverlay.Lines) || [];
-    const numberLike = /^0*(\d{1,4})(\s*\/\s*\d{1,4})?[a-z]?$/i;
-
-    if (lines.length) {
-      const maxBottom = Math.max(...lines.map(l => l.MinTop + (l.MaxHeight || 0)));
-      const splitY = maxBottom / 2; // the gap sits roughly in the middle of the composite
-      const candidates = lines.filter(l => {
-        const midY = l.MinTop + (l.MaxHeight || 0) / 2;
-        return midY > splitY && numberLike.test(l.LineText.trim());
-      });
-      if (candidates.length) {
-        candidates.sort((a, b) => b.MinTop - a.MinTop); // closest to the true bottom
-        return candidates[0].LineText.trim().match(numberLike)[1];
-      }
-    }
-
-    // No position data at all — last resort, only trust an explicit NNN/NNN shape.
-    const text = parsedResult.ParsedText || '';
-    const slashMatch = text.match(/0*(\d{1,4})\s*\/\s*\d{1,4}/);
-    return slashMatch ? slashMatch[1] : null;
-  }
-
-  // ---------- Full pipeline: crop -> OCR -> guess -> Scryfall ----------
+  // ---------- Full pipeline: crop -> OCR -> guess -> Scryfall -> printings ----------
   async function processImage(sourceCanvas){
     resultEl.innerHTML = '';
     setStatus('Reading card text…');
     try {
-      const composite = buildScanComposite(sourceCanvas);
-      const dataUrl = composite.toDataURL('image/jpeg', 0.95);
+      const titleCrop = cropRegion(sourceCanvas, 0, 0, 1, 0.16);
+      const dataUrl = titleCrop.toDataURL('image/jpeg', 0.95);
       const parsed = await runOCR(dataUrl);
       const guess = extractNameGuess(parsed);
-      lastCollectorGuess = extractCollectorNumber(parsed);
       if (!guess) {
         setStatus('Could not read any text — type the name manually below.', true);
         return;
       }
       searchInput.value = guess;
-      setStatus('Read "' + guess + '"' + (lastCollectorGuess ? ' (collector # ' + lastCollectorGuess + ')' : '') + ' — searching Scryfall…');
-      // Fuzzy match directly — it already resolves exact names too, so this saves
-      // the extra round-trip an exact-then-fallback call would otherwise make.
-      await fetchFuzzy(guess);
+      setStatus('Read "' + guess + '" — searching Scryfall…');
+      await identifyByName(guess);
     } catch (e) {
       setStatus('OCR failed: ' + e.message + ' — you can still type the name manually below.', true);
     }
@@ -275,9 +252,11 @@
     return fetch(url);
   }
 
-  // Single request — used right after OCR, since fuzzy already matches exact names too.
-  async function fetchFuzzy(name){
+  // Resolve a name to its canonical card, then show every printing of it so the
+  // person can pick the one matching the photo (and see foil/non-foil price for each).
+  async function identifyByName(name){
     if (!name) return;
+    setStatus('Looking up "' + name + '"…');
     try {
       const res = await scryfallFetch(`https://api.scryfall.com/cards/named?fuzzy=${encodeURIComponent(name)}`);
       if (!res.ok) {
@@ -285,12 +264,62 @@
         return;
       }
       const card = await res.json();
-      renderCard(card);
-      setStatus('Matched via Scryfall.');
+      setStatus('Found "' + card.name + '" — loading printings…');
+      await loadPrintings(card);
     } catch (e) {
       setStatus('Lookup failed: ' + e.message, true);
     }
   }
+
+  async function loadPrintings(card){
+    try {
+      const res = await scryfallFetch(card.prints_search_uri + '&order=released&dir=desc');
+      const data = await res.json();
+      const prints = (data.data && data.data.length) ? data.data : [card];
+      showPrintsModal(prints, card.name, data.has_more);
+      setStatus('Pick the printing that matches your photo.');
+    } catch (e) {
+      // Fall back to just showing the single resolved card.
+      renderCard(card);
+      setStatus('Found "' + card.name + '" but could not load other printings.', true);
+    }
+  }
+
+  function showPrintsModal(prints, name, hasMore){
+    printsTitle.textContent = 'Choose printing — ' + name;
+    printsList.innerHTML = '';
+    prints.forEach(p => {
+      const img = getImage(p);
+      const nonfoil = p.prices && p.prices.usd ? '$' + p.prices.usd : '—';
+      const foil = p.prices && p.prices.usd_foil ? '$' + p.prices.usd_foil : '—';
+      const row = document.createElement('div');
+      row.className = 'print-row';
+      row.innerHTML = `
+        ${img ? `<img src="${img}">` : ''}
+        <div class="info">
+          ${p.set_name}<br>
+          <small>${(p.set || '').toUpperCase()} #${p.collector_number || '?'} · ${p.rarity || ''}</small>
+        </div>
+        <div class="prices">
+          Non-foil: ${nonfoil}<br>
+          Foil: ${foil}
+        </div>
+      `;
+      row.addEventListener('click', () => {
+        renderCard(p);
+        printsBackdrop.style.display = 'none';
+        setStatus('Selected the ' + p.set_name + ' printing.');
+      });
+      printsList.appendChild(row);
+    });
+    printsNote.textContent = hasMore ? 'Showing the most recent printings — older ones exist too.' : '';
+    printsBackdrop.style.display = 'flex';
+  }
+
+  printsClose.addEventListener('click', () => { printsBackdrop.style.display = 'none'; });
+  printsBackdrop.addEventListener('click', e => {
+    if (e.target === printsBackdrop) printsBackdrop.style.display = 'none';
+  });
 
   // ---------- Autocomplete (manual correction path) ----------
   let debounceTimer = null;
@@ -314,7 +343,7 @@
         div.addEventListener('click', () => {
           searchInput.value = name;
           suggestions.innerHTML = '';
-          fetchExact(name);
+          identifyByName(name);
         });
         suggestions.appendChild(div);
       });
@@ -324,29 +353,9 @@
   searchInput.addEventListener('keydown', e => {
     if (e.key === 'Enter') {
       suggestions.innerHTML = '';
-      fetchExact(searchInput.value.trim(), true);
+      identifyByName(searchInput.value.trim());
     }
   });
-
-  async function fetchExact(name, allowFuzzy){
-    if (!name) return;
-    setStatus('Looking up "' + name + '"…');
-    try {
-      let res = await scryfallFetch(`https://api.scryfall.com/cards/named?exact=${encodeURIComponent(name)}`);
-      if (res.status === 404 && allowFuzzy) {
-        res = await scryfallFetch(`https://api.scryfall.com/cards/named?fuzzy=${encodeURIComponent(name)}`);
-      }
-      if (!res.ok) {
-        setStatus('No match found for "' + name + '" — edit the text above and try again.', true);
-        return;
-      }
-      const card = await res.json();
-      renderCard(card);
-      setStatus('Matched via Scryfall.');
-    } catch (e) {
-      setStatus('Lookup failed: ' + e.message, true);
-    }
-  }
 
   // ---------- Render card result ----------
   function getImage(card){
