@@ -181,6 +181,45 @@
     return plain[0] || '';
   }
 
+  // Collector number is printed small, bottom-left of the card — usually just "070",
+  // occasionally "070/264". Bare digits are ambiguous anywhere else on the card
+  // (mana cost, power/toughness, loyalty), so position is what disambiguates it,
+  // not the digit shape.
+  function extractCollectorNumber(parsedResult){
+    if (!parsedResult) return null;
+    const lines = (parsedResult.TextOverlay && parsedResult.TextOverlay.Lines) || [];
+    const numberLike = /^0*(\d{1,4})(\s*\/\s*\d{1,4})?[a-z]?$/i;
+
+    if (lines.length) {
+      const tops = lines.map(l => l.MinTop);
+      const bottoms = lines.map(l => l.MinTop + (l.MaxHeight || 0));
+      const lefts = lines.map(l => Math.min(...(l.Words || []).map(w => w.Left)) || 0);
+      const minTop = Math.min(...tops), maxBottom = Math.max(...bottoms);
+      const minLeft = Math.min(...lefts), maxLeft = Math.max(...lefts);
+      const bottomThreshold = minTop + 0.75 * (maxBottom - minTop);
+      const leftThreshold = minLeft + 0.5 * (maxLeft - minLeft || 1);
+
+      const candidates = lines
+        .map((l, i) => ({ line: l, top: tops[i], left: lefts[i] }))
+        .filter(c => c.top >= bottomThreshold && c.left <= leftThreshold)
+        .map(c => ({ ...c, cleaned: c.line.LineText.trim() }))
+        .filter(c => numberLike.test(c.cleaned));
+
+      if (candidates.length) {
+        // prefer the bottom-most, left-most match
+        candidates.sort((a, b) => (b.top - a.top) || (a.left - b.left));
+        return candidates[0].cleaned.match(numberLike)[1];
+      }
+    }
+
+    // Fallback with no position data: look for a NNN/NNN pair anywhere in the text.
+    const text = parsedResult.ParsedText || '';
+    const slashMatch = text.match(/0*(\d{1,4})\s*\/\s*\d{1,4}/);
+    return slashMatch ? slashMatch[1] : null;
+  }
+
+  let lastCollectorGuess = null;
+
   // ---------- Full pipeline: OCR -> guess -> Scryfall ----------
   async function processImage(dataUrl){
     resultEl.innerHTML = '';
@@ -188,13 +227,16 @@
     try {
       const parsed = await runOCR(dataUrl);
       const guess = extractNameGuess(parsed);
+      lastCollectorGuess = extractCollectorNumber(parsed);
       if (!guess) {
         setStatus('Could not read any text — type the name manually below.', true);
         return;
       }
       searchInput.value = guess;
-      setStatus('Read "' + guess + '" — searching Scryfall…');
-      await fetchExact(guess, true);
+      setStatus('Read "' + guess + '"' + (lastCollectorGuess ? ' (collector # ' + lastCollectorGuess + ')' : '') + ' — searching Scryfall…');
+      // Fuzzy match directly — it already resolves exact names too, so this saves
+      // the extra round-trip an exact-then-fallback call would otherwise make.
+      await fetchFuzzy(guess);
     } catch (e) {
       setStatus('OCR failed: ' + e.message + ' — you can still type the name manually below.', true);
     }
@@ -204,10 +246,27 @@
   let lastCall = 0;
   async function scryfallFetch(url){
     const now = Date.now();
-    const wait = Math.max(0, 120 - (now - lastCall));
+    const wait = Math.max(0, 75 - (now - lastCall));
     if (wait) await new Promise(r => setTimeout(r, wait));
     lastCall = Date.now();
     return fetch(url);
+  }
+
+  // Single request — used right after OCR, since fuzzy already matches exact names too.
+  async function fetchFuzzy(name){
+    if (!name) return;
+    try {
+      const res = await scryfallFetch(`https://api.scryfall.com/cards/named?fuzzy=${encodeURIComponent(name)}`);
+      if (!res.ok) {
+        setStatus('No match found for "' + name + '" — edit the text above and try again.', true);
+        return;
+      }
+      const card = await res.json();
+      renderCard(card);
+      setStatus('Matched via Scryfall.');
+    } catch (e) {
+      setStatus('Lookup failed: ' + e.message, true);
+    }
   }
 
   // ---------- Autocomplete (manual correction path) ----------
@@ -287,6 +346,10 @@
     currentCard = card;
     const img = getImage(card);
     const price = card.prices && card.prices.usd ? '$' + card.prices.usd : '-';
+    const cnMatch = lastCollectorGuess
+      ? (lastCollectorGuess === String(card.collector_number).replace(/^0+(?=\d)/, '')
+          ? ' ✓ matches OCR read' : ' (OCR read #' + lastCollectorGuess + ' — double check)')
+      : '';
     resultEl.innerHTML = `
       ${img ? `<img src="${img}" alt="${card.name}">` : ''}
       <div>
@@ -294,7 +357,7 @@
         <small>${getManaCost(card)}</small><br>
         <small>${card.type_line || ''}</small>
         <p style="font-size:12px;max-height:100px;overflow-y:auto;">${(getOracle(card) || '').replace(/\n/g, '<br>')}</p>
-        <small>${(card.set || '').toUpperCase()} #${card.collector_number || '?'} · ${price}</small><br>
+        <small>${(card.set || '').toUpperCase()} #${card.collector_number || '?'}${cnMatch} · ${price}</small><br>
         <a href="${card.scryfall_uri}" target="_blank" rel="noopener">Scryfall page</a>
       </div>
     `;
